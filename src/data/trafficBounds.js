@@ -13,6 +13,8 @@
  * @module data/trafficBounds
  */
 
+import { normalizeLongitudeDeg, wrapLongitudeDeltaDeg } from './approxDistance.js';
+
 /** @const {number} Mean Earth radius in km (spherical approximation). */
 const EARTH_RADIUS_KM = 6371;
 
@@ -128,11 +130,17 @@ export function deriveFetchCenter({ nadirLat, nadirLon, hitLat, hitLon, maxPullK
  */
 export function clampBoundsAroundCenter(bounds, center, maxSpanDeg = 0.05) {
   const latSpan = Math.min(bounds.north - bounds.south, maxSpanDeg);
-  const lonSpan = Math.min(bounds.east - bounds.west, maxSpanDeg);
+  // Cesium reports a rectangle that crosses the antimeridian with east < west,
+  // so a raw `east - west` is a large NEGATIVE number there. Math.min then
+  // chose that instead of maxSpanDeg and the box came back inverted and ~360
+  // degrees wide, with longitudes outside [-180, 180) (observed: west 359.89).
+  // Take the wrapped span so the width is always the short way round, and
+  // never negative.
+  const lonSpan = Math.min(Math.abs(wrapLongitudeDeltaDeg(bounds.east - bounds.west)), maxSpanDeg);
   return {
     south: center.lat - latSpan / 2,
     north: center.lat + latSpan / 2,
-    west: center.lon - lonSpan / 2,
-    east: center.lon + lonSpan / 2,
+    west: normalizeLongitudeDeg(center.lon - lonSpan / 2),
+    east: normalizeLongitudeDeg(center.lon + lonSpan / 2),
   };
 }

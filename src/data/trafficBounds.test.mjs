@@ -108,3 +108,41 @@ test('span clamp is idempotent on already-clamped bounds (loadRoadsForBounds re-
   const twice = clampBoundsAroundCenter(once, midpoint, 0.05);
   assert.deepEqual(twice, once);
 });
+
+test('span clamp: an antimeridian-crossing view rectangle stays a small box', () => {
+  // Cesium reports a rectangle that crosses +-180 with east < west. A raw
+  // `east - west` is then a large NEGATIVE number, which Math.min preferred
+  // over maxSpanDeg — the box came back inverted, ~360 degrees wide, with
+  // longitudes outside [-180, 180) (observed: west 359.89).
+  const bounds = { south: -16.9, north: -16.7, west: 179.9, east: -179.9 };
+  const center = { lat: -16.8, lon: 179.99 };
+  const clamped = clampBoundsAroundCenter(bounds, center, 0.05);
+
+  const lonSpan = (((clamped.east - clamped.west) + 540) % 360) - 180;
+  assert.ok(Math.abs(lonSpan - 0.05) < 1e-9, `expected a 0.05 deg span, got ${lonSpan}`);
+  assert.ok(Math.abs((clamped.north - clamped.south) - 0.05) < 1e-12);
+  for (const lon of [clamped.west, clamped.east]) {
+    assert.ok(lon >= -180 && lon < 180, `longitude out of range: ${lon}`);
+  }
+});
+
+test('span clamp: a box centered exactly on the antimeridian stays in range', () => {
+  const bounds = { south: 64.9, north: 65.1, west: 179.95, east: -179.95 };
+  const clamped = clampBoundsAroundCenter(bounds, { lat: 65, lon: 180 }, 0.05);
+  for (const lon of [clamped.west, clamped.east]) {
+    assert.ok(lon >= -180 && lon < 180, `longitude out of range: ${lon}`);
+  }
+  const lonSpan = (((clamped.east - clamped.west) + 540) % 360) - 180;
+  assert.ok(Math.abs(lonSpan - 0.05) < 1e-9);
+});
+
+test('span clamp: the longitude span is never negative', () => {
+  for (const [west, east] of [[179.9, -179.9], [-179.9, 179.9], [10, 10], [170, -170]]) {
+    const clamped = clampBoundsAroundCenter(
+      { south: 0, north: 0.02, west, east }, { lat: 0.01, lon: west }, 0.05,
+    );
+    const lonSpan = (((clamped.east - clamped.west) + 540) % 360) - 180;
+    assert.ok(lonSpan >= 0, `negative span for west=${west} east=${east}: ${lonSpan}`);
+    assert.ok(lonSpan <= 0.05 + 1e-9, `span exceeded the cap: ${lonSpan}`);
+  }
+});

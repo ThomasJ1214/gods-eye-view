@@ -1,6 +1,6 @@
 # KNOWN ISSUES
 
-Updated: July 8, 2026
+Updated: September 7, 2026
 
 This file tracks active runtime issues only.
 
@@ -30,22 +30,34 @@ Next iteration candidates:
 
 ---
 
-### CCTV panel can appear "missing" after layout refactors
-Status: Open (workaround available)
+### Data layers are quiet within a few km of the antimeridian
+Status: Open (partially mitigated)
 
 Context:
-- Panel positions are persisted in local storage and can restore off-screen after UI changes.
+- Overpass accepts one bounding box per query and requires `west < east`, so a
+  box straddling +-180 cannot be expressed as a single query. The traffic and
+  annotation layers therefore have no roads to draw when the camera sits
+  within roughly half a viewport of the date line (Taveuni and Vanua Levu in
+  Fiji, Wrangel Island, the Chukotka/Alaska corridor).
 
-Workaround:
-- In browser console:
-  - `localStorage.removeItem('godsEyeView.v6.panelPos.cctv-panel');`
-  - `localStorage.removeItem('godsEyeView.v6.panelCollapsed.cctv-panel');`
-  - `location.reload();`
+Fixed as of this entry (was much worse):
+- `clampBoundsAroundCenter` took a raw `east - west` span, which is a large
+  NEGATIVE number for a Cesium rectangle crossing +-180. The fetch box came
+  back inverted and ~360 degrees wide with out-of-range longitudes, and the
+  proxy's bbox guard rejected it. `getBoundsCenter` averaged west and east,
+  which lands on the ANTIPODE for the same rectangles.
+- Six copies of an equirectangular distance helper measured the long way round
+  across the date line (179E to 179W read as ~39,800 km rather than ~220 km),
+  so the aircraft ground-floor clamp, the mesh-floor probe and voice "nearest"
+  selection all silently failed their proximity gates near +-180. All six now
+  share `src/data/approxDistance.js`.
 
-Related keys (current versions):
-- Panel positions: `godsEyeView.v7.panelPos.<panel-id>` (re-versioned 2026-06-10)
-- Panel collapsed state: `godsEyeView.v6.panelCollapsed.<panel-id>`
-- CCTV calibration: `godsEyeView.cctv.calibration.v2`
+Next iteration candidate:
+- Split a straddling viewport into two bounded queries (west..180 and
+  -180..east) and merge the results, rather than declining to fetch.
+
+Validation target:
+- `src/data/trafficBounds.js`, `src/data/approxDistance.js`
 
 ---
 
@@ -79,6 +91,30 @@ Context:
 
 Validation target:
 - `vite.config.js`
+
+---
+
+### CCTV panel could restore off-screen after layout refactors
+Status: Closed as fixed on `main`
+
+Context:
+- Panel positions persist in local storage, and a position saved at one window
+  size could restore off-screen at another (a panel was observed at x:-192).
+  The documented workaround was to clear the keys from the browser console.
+
+Current behavior:
+- `_restorePanelPosition` clamps the restored position through
+  `_clampToViewport` (6 px inset), the same clamp the drag handler applies, so
+  a saved position can no longer land off-screen. No console workaround is
+  needed.
+
+Related keys (current versions):
+- Panel positions: `godsEyeView.v7.panelPos.<panel-id>` (re-versioned 2026-06-10)
+- Panel collapsed state: `godsEyeView.v6.panelCollapsed.<panel-id>`
+- CCTV calibration: `godsEyeView.cctv.calibration.v2`
+
+Validation target:
+- `src/ui.js`
 
 ---
 

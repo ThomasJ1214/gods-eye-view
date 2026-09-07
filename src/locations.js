@@ -1,4 +1,5 @@
 import * as Cesium from 'cesium';
+import { approxDistanceM } from './data/approxDistance.js';
 import { viewportBias, placesNearViewRecovery } from './annotations/annotationResolver.js';
 
 /**
@@ -890,7 +891,7 @@ function selectBuildingBounds(elements, targetLat, targetLon, query) {
     if (!bounds || bounds.width < 2 || bounds.depth < 2) continue;
     const tags = element.tags || {};
     const center = element.center || averageCoordinate(coordinates);
-    const distanceM = approximateDistanceM(targetLat, targetLon, center.lat, center.lon);
+    const distanceM = approxDistanceM(targetLat, targetLon, center.lat, center.lon);
     const nameWords = normalizedWords([
       tags.name,
       tags['name:en'],
@@ -930,16 +931,29 @@ function elementCoordinates(element) {
   ));
 }
 
+/**
+ * Extent of an OSM element's geometry, in metres.
+ *
+ * Swept in ONE pass rather than via `Math.min(...array)`: these coordinates come
+ * straight from an Overpass relation, whose member geometry routinely runs to
+ * six figures of points, and spreading an array that long past the engine's
+ * argument limit throws RangeError — the same failure that silently dropped two
+ * of three FIRMS sources (#93). A reduce also skips the two intermediate arrays.
+ */
 function coordinateBounds(coordinates, latitude) {
-  const latitudes = coordinates.map((point) => point.lat);
-  const longitudes = coordinates.map((point) => point.lon);
-  const south = Math.min(...latitudes);
-  const north = Math.max(...latitudes);
-  const west = Math.min(...longitudes);
-  const east = Math.max(...longitudes);
+  let south = Infinity;
+  let north = -Infinity;
+  let west = Infinity;
+  let east = -Infinity;
+  for (const point of coordinates) {
+    if (point.lat < south) south = point.lat;
+    if (point.lat > north) north = point.lat;
+    if (point.lon < west) west = point.lon;
+    if (point.lon > east) east = point.lon;
+  }
   return {
-    width: approximateDistanceM(latitude, west, latitude, east),
-    depth: approximateDistanceM(south, west, north, west),
+    width: approxDistanceM(latitude, west, latitude, east),
+    depth: approxDistanceM(south, west, north, west),
   };
 }
 
@@ -998,15 +1012,6 @@ function pointInPolygon(lon, lat, coordinates) {
     if (intersects) inside = !inside;
   }
   return inside;
-}
-
-function approximateDistanceM(latA, lonA, latB, lonB) {
-  const latitudeScale = 111320;
-  const longitudeScale = latitudeScale * Math.cos(Cesium.Math.toRadians((latA + latB) / 2));
-  return Math.hypot(
-    (latB - latA) * latitudeScale,
-    (lonB - lonA) * longitudeScale
-  );
 }
 
 function finitePositive(value) {

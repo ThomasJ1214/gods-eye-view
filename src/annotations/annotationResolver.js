@@ -1,4 +1,5 @@
 import * as Cesium from 'cesium';
+import { approxDistanceM } from '../data/approxDistance.js';
 import { lookupNeighborhoodRing } from '../data/neighborhoodPolygons.js';
 import { lookupNaturalRegionOutline, findNaturalRegion } from '../data/naturalEarthRegions.js';
 import { registerDynamicCredit, NATURAL_EARTH_CREDIT } from '../data/dataCredits.js';
@@ -158,7 +159,7 @@ export async function resolveAnnotationTarget({
         // (neighborhoods, nearby buildings) are NOT far, so they keep the geocode + scope/polygon path.
         if (center && trace.places === 'skipped' && !bypassNearViewGuards) {
           let geocodeFar = source !== 'geocode';
-          if (source === 'geocode' && approximateDistanceM(center.lat, center.lon, lat, lon) / 1000 > MIN_DRIFT_FLOOR_KM) {
+          if (source === 'geocode' && approxDistanceM(center.lat, center.lon, lat, lon) / 1000 > MIN_DRIFT_FLOOR_KM) {
             geocodeFar = true;
           }
           if (geocodeFar) {
@@ -237,7 +238,7 @@ export async function resolveAnnotationTarget({
   const vpGate = viewportProximity(viewer);
   const gateDrift = (gLat, gLon) => {
     if (!vpGate) return null; // no camera info → pass
-    const driftKm = approximateDistanceM(vpGate.lat, vpGate.lon, gLat, gLon) / 1000;
+    const driftKm = approxDistanceM(vpGate.lat, vpGate.lon, gLat, gLon) / 1000;
     const limitKm = Math.max(VIEWPORT_DRIFT_FACTOR * vpGate.radiusKm, MIN_DRIFT_FLOOR_KM);
     return driftKm > limitKm ? { driftKm, limitKm } : null;
   };
@@ -570,7 +571,7 @@ function groundsRadiusFromViewport(viewport) {
     || ![lo.latitude, lo.longitude, hi.latitude, hi.longitude].every(Number.isFinite)) {
     return GROUNDS_RADIUS_M;
   }
-  const diagM = approximateDistanceM(lo.latitude, lo.longitude, hi.latitude, hi.longitude);
+  const diagM = approxDistanceM(lo.latitude, lo.longitude, hi.latitude, hi.longitude);
   const r = diagM / 2;
   if (!Number.isFinite(r) || r <= 0) return GROUNDS_RADIUS_M;
   return Math.max(GROUNDS_RADIUS_MIN_M, Math.min(GROUNDS_RADIUS_MAX_M, r));
@@ -695,7 +696,7 @@ async function placesTextSearch(query, centerLat, centerLon, radiusM, signal) {
       lat: hit.latitude,
       lon: hit.longitude,
       label: hit.name || null,
-      distanceM: approximateDistanceM(centerLat, centerLon, hit.latitude, hit.longitude),
+      distanceM: approxDistanceM(centerLat, centerLon, hit.latitude, hit.longitude),
       viewport: hit.viewport || null,
       // Entity identity/classification — the proxy already pays for these in its field
       // mask, so keep them: `primaryType`/`types` classify the feature (point-like
@@ -1100,7 +1101,7 @@ async function fetchStreet(lat, lon, query, signal) {
 
 /** Chain street way-segments into one contiguous polyline by endpoint matching. */
 function stitchLine(segments) {
-  const same = (a, b) => approximateDistanceM(a[1], a[0], b[1], b[0]) < 2;
+  const same = (a, b) => approxDistanceM(a[1], a[0], b[1], b[0]) < 2;
   const remaining = segments.map((s) => s.slice());
   let line = remaining.shift();
   let advanced = true;
@@ -1541,7 +1542,7 @@ export function selectFootprint(elements, targetLat, targetLon, query, mode = 'l
     const contains = pointInPolygon(targetLon, targetLat, coords);
     const centroid = ringCentroid(coords.map((p) => [p.lon, p.lat]));
     const distanceM = centroid
-      ? approximateDistanceM(targetLat, targetLon, centroid.lat, centroid.lon)
+      ? approxDistanceM(targetLat, targetLon, centroid.lat, centroid.lon)
       : 9999;
 
     // Name match dominates; completeness breaks ties so the feature literally
@@ -1659,7 +1660,7 @@ function ringSpanM(chain) {
     if (p.lon < minLon) minLon = p.lon;
     if (p.lon > maxLon) maxLon = p.lon;
   }
-  return approximateDistanceM(minLat, minLon, maxLat, maxLon);
+  return approxDistanceM(minLat, minLon, maxLat, maxLon);
 }
 
 /** Chain ways into maximal connected components by endpoint matching. */
@@ -1698,7 +1699,7 @@ function endpointGapM(chain) {
   if (!chain || chain.length < 2) return Infinity;
   const a = chain[0];
   const b = chain[chain.length - 1];
-  return approximateDistanceM(a.lat, a.lon, b.lat, b.lon);
+  return approxDistanceM(a.lat, a.lon, b.lat, b.lon);
 }
 
 
@@ -1736,12 +1737,6 @@ function approximateAreaM2(coords) {
     area += xj * yi - xi * yj;
   }
   return Math.abs(area) / 2;
-}
-
-function approximateDistanceM(latA, lonA, latB, lonB) {
-  const latScale = 111_320;
-  const lonScale = latScale * Math.cos(Cesium.Math.toRadians((latA + latB) / 2));
-  return Math.hypot((latB - latA) * latScale, (lonB - lonA) * lonScale);
 }
 
 function pointInPolygon(lon, lat, coords) {
@@ -1834,7 +1829,7 @@ export async function placesNearViewRecovery(viewer, query, geocoded = null, sig
   const center = pickWorldFromScreen(viewer, 0.5, 0.5) || viewportProximity(viewer);
   if (!center) return null;
   const geocodeFar = !geocoded
-    || approximateDistanceM(center.lat, center.lon, geocoded.lat, geocoded.lon) / 1000 > MIN_DRIFT_FLOOR_KM;
+    || approxDistanceM(center.lat, center.lon, geocoded.lat, geocoded.lon) / 1000 > MIN_DRIFT_FLOOR_KM;
   if (!geocodeFar) return null;
   const hit = await placesTextSearch(query, center.lat, center.lon, 6000, signal);
   return (hit && hit.distanceM <= PLACES_MAX_DISTANCE_M) ? hit : null;

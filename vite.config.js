@@ -133,6 +133,18 @@ let _openskyCacheMeta = null;
 let _openskyCacheSourceEpochMs = null;
 /** TTL for the OpenSky response cache (ms). */
 const OPENSKY_CACHE_MS = 9000;
+/**
+ * Upstream deadlines for the OpenSky calls.
+ *
+ * Node's fetch has no overall response deadline — undici only gives up after
+ * ~300 s of header silence — and this handler has no in-flight coalescing (the
+ * GBFS / TomTom / terrain proxies do). A stalled upstream therefore held one
+ * request open while the client's 9 s poll opened another, and another, until
+ * dozens of sockets were parked on OpenSky. Every other upstream in this file
+ * carries an AbortSignal.timeout; these were the outliers.
+ */
+const OPENSKY_STATES_TIMEOUT_MS = 20_000;
+const OPENSKY_TOKEN_TIMEOUT_MS = 10_000;
 // --- OpenSky credit governor (field-test fix 2026-07-06) -------------------
 // The global /states/all this proxy fetches costs 4 CREDITS per call against
 // OpenSky's ~4000/day authenticated budget — a day with the app open burned
@@ -1380,6 +1392,16 @@ const OPENAI_REALTIME_REASONING_DEFAULT = 'low';
 const OPENAI_REALTIME_CONTEXT_TOKENS_DEFAULT = 3000;
 const OPENAI_REALTIME_CONTEXT_RETENTION_DEFAULT = 0.5;
 const OPENAI_HUD_SUMMARY_MODEL_DEFAULT = 'gpt-5-nano';
+/**
+ * Upstream deadlines for the key-brokering endpoints. Node's fetch has no
+ * overall response deadline of its own (undici gives up only after ~300 s of
+ * header silence), so without these a stalled provider parked a dev-server
+ * request — and the browser behind it — for minutes. Every other upstream in
+ * this file carries an AbortSignal.timeout; these were the outliers.
+ */
+const OPENAI_HUD_SUMMARY_TIMEOUT_MS = 30_000;
+const OPENAI_REALTIME_TOKEN_TIMEOUT_MS = 15_000;
+const GOOGLE_PLACES_TIMEOUT_MS = 15_000;
 const REALTIME_DEBUG_LOG_DIR = path.join(__dirname, '.gev-logs');
 const REALTIME_DEBUG_LOG_FILE = path.join(REALTIME_DEBUG_LOG_DIR, 'realtime-conversations.jsonl');
 const REALTIME_DEBUG_LOG_MAX_BYTES = 8 * 1024 * 1024;
@@ -1400,7 +1422,13 @@ let _aisNeedsRearm = false;
 let _aisWebSocketImpl;
 /** @type {Map<string,object>} */
 const _aisStreamVessels = new Map();
-/** @type {Map<string,object>} */
+/**
+ * mmsi -> last-seen ShipStaticData (name/type/destination/IMO), merged into
+ * position reports that omit it. Pruned alongside _aisStreamVessels: a vessel
+ * that only ever sent static data has no position row to age out, so it needs
+ * its own timestamp to be evictable at all.
+ * @type {Map<string,{name?:string,type?:string,destination?:string,imo?:string,_updatedAt:number}>}
+ */
 const _aisStreamStatic = new Map();
 /** @type {Map<string,{lats:Float32Array,lons:Float32Array,times:Uint32Array,head:number,len:number}>} mmsi -> track ring buffer */
 const _aisStreamTracks = new Map();
@@ -1438,6 +1466,7 @@ async function getOpenSkyToken() {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`,
+          signal: AbortSignal.timeout(OPENSKY_TOKEN_TIMEOUT_MS),
         }
       );
 
@@ -2390,26 +2419,73 @@ function terrainHeightsProxy() {
 function adsbdbProxy() {
   const TTL_MS = 24 * 3600_000;
   const CACHE_PATH = path.join(process.cwd(), '.gev-cache', 'adsbdb.json');
-  let cache = { routes: {}, aircraft: {} };
+  /**
+   * Per-kind entry cap. Every other cache in this file is bounded
+   * (ADSBLOL_POINT_CACHE_MAX, OVERPASS_CACHE_MAX_ENTRIES, TRACK_CACHE_MAX);
+   * this one was not, so a long-lived dev server accumulated an entry for
+   * every callsign and hex address it ever saw — in memory AND in the JSON it
+   * rewrites to disk every 15 s. Maps replace the former plain objects so
+   * insertion order gives a cheap oldest-first eviction.
+   */
+  const CACHE_MAX_ENTRIES = 4000;
+  /** @type {{routes: Map<string, object>, aircraft: Map<string, object>}} */
+  const cache = { routes: new Map(), aircraft: new Map() };
   let dirty = false;
-  let loaded = false;
+  /** @type {Promise<void>|null} The single in-flight (or settled) disk load. */
+  let loadPromise = null;
   const inflight = new Map();
 
-  async function loadOnce() {
-    if (loaded) return;
-    loaded = true;
-    try {
-      const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
-      cache = { routes: parsed.routes ?? {}, aircraft: parsed.aircraft ?? {} };
-    } catch { /* first run */ }
-    setInterval(async () => {
-      if (!dirty) return;
-      dirty = false;
+  /** Store an entry, evicting the oldest once the kind is at capacity. */
+  function remember(store, key, entry) {
+    store.delete(key); // re-insert so a refreshed key becomes the newest
+    store.set(key, entry);
+    while (store.size > CACHE_MAX_ENTRIES) {
+      const oldest = store.keys().next().value;
+      if (oldest === undefined) break;
+      store.delete(oldest);
+    }
+  }
+
+  /** Seed a Map from the persisted object, newest-last and capped. */
+  function hydrate(store, persisted) {
+    if (!persisted || typeof persisted !== 'object') return;
+    const entries = Object.entries(persisted)
+      .filter(([, entry]) => entry && Number.isFinite(entry.at))
+      .sort((a, b) => a[1].at - b[1].at) // oldest first, so the cap keeps the newest
+      .slice(-CACHE_MAX_ENTRIES);
+    for (const [key, entry] of entries) if (!store.has(key)) store.set(key, entry);
+  }
+
+  /**
+   * Read the disk cache exactly once, and make every caller await the SAME
+   * promise. The previous `loaded` boolean was set before the await, so a
+   * second concurrent request saw "loaded", raced ahead, and cached its
+   * lookup into a `cache` object that the still-pending read then REPLACED
+   * wholesale — losing that result and writing the disk snapshot back over it.
+   * Mutating shared Maps instead of reassigning removes the seam entirely.
+   */
+  function loadOnce() {
+    if (loadPromise) return loadPromise;
+    loadPromise = (async () => {
       try {
-        await fsp.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-        await fsp.writeFile(CACHE_PATH, JSON.stringify(cache), 'utf8');
-      } catch { dirty = true; } // retry next tick
-    }, 15_000).unref?.();
+        const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
+        hydrate(cache.routes, parsed.routes);
+        hydrate(cache.aircraft, parsed.aircraft);
+      } catch { /* first run */ }
+      setInterval(async () => {
+        if (!dirty) return;
+        dirty = false;
+        try {
+          await fsp.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+          const snapshot = {
+            routes: Object.fromEntries(cache.routes),
+            aircraft: Object.fromEntries(cache.aircraft),
+          };
+          await fsp.writeFile(CACHE_PATH, JSON.stringify(snapshot), 'utf8');
+        } catch { dirty = true; } // retry next tick
+      }, 15_000).unref?.();
+    })();
+    return loadPromise;
   }
 
   const fresh = (e) => e && Date.now() - e.at < TTL_MS;
@@ -2438,7 +2514,7 @@ function adsbdbProxy() {
 
   function lookup(kind, key) {
     const store = kind === 'route' ? cache.routes : cache.aircraft;
-    if (fresh(store[key])) return Promise.resolve(store[key].data);
+    if (fresh(store.get(key))) return Promise.resolve(store.get(key).data);
     const ik = `${kind}:${key}`;
     if (!inflight.has(ik)) {
       inflight.set(ik, (async () => {
@@ -2449,18 +2525,18 @@ function adsbdbProxy() {
           const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
           if (res.ok) {
             const data = kind === 'route' ? parseRoute(await res.json()) : parseAircraft(await res.json());
-            store[key] = { at: Date.now(), data }; // data may be null — negative cache
+            remember(store, key, { at: Date.now(), data }); // data may be null — negative cache
             dirty = true;
             return data;
           }
           if (res.status === 404) {
-            store[key] = { at: Date.now(), data: null }; // known-missing — cache the miss
+            remember(store, key, { at: Date.now(), data: null }); // known-missing — cache the miss
             dirty = true;
           }
           // other statuses: leave uncached so we retry later
-          return fresh(store[key]) ? store[key].data : null;
+          return fresh(store.get(key)) ? store.get(key).data : null;
         } catch {
-          return fresh(store[key]) ? store[key].data : null; // network error → stale if any
+          return fresh(store.get(key)) ? store.get(key).data : null; // network error → stale if any
         } finally {
           inflight.delete(ik);
         }
@@ -3109,7 +3185,10 @@ function openSkyProxy() {
             }
           }
 
-          let upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers });
+          let upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', {
+            headers,
+            signal: AbortSignal.timeout(OPENSKY_STATES_TIMEOUT_MS),
+          });
           // Auto-mode fallback: if OAuth was rejected, retry with Basic credentials
           if (
             (upstream.status === 401 || upstream.status === 403) &&
@@ -3121,7 +3200,10 @@ function openSkyProxy() {
               Accept: 'application/json',
               Authorization: `Basic ${Buffer.from(`${basicUser}:${basicPass}`).toString('base64')}`,
             };
-            upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers: retryHeaders });
+            upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', {
+              headers: retryHeaders,
+              signal: AbortSignal.timeout(OPENSKY_STATES_TIMEOUT_MS),
+            });
             usedMode = 'basic';
             reason = 'oauth_rejected_fallback_basic';
           }
@@ -4815,6 +4897,8 @@ function adsbLolProxy() {
   let _cacheAt = 0;
   /** Response cache TTL (ms). */
   const CACHE_MS = 12000;
+  /** Upstream deadline — Node's fetch has none of its own. */
+  const ADSBLOL_MIL_TIMEOUT_MS = 15_000;
   return {
     name: 'adsblol-proxy',
     configureServer(server) {
@@ -4828,6 +4912,7 @@ function adsbLolProxy() {
           }
           const upstream = await fetch('https://api.adsb.lol/v2/mil', {
             headers: { 'User-Agent': 'gods-eye-view-adsblol-proxy/1.0' },
+            signal: AbortSignal.timeout(ADSBLOL_MIL_TIMEOUT_MS),
           });
           const body = await upstream.text();
           if (upstream.ok) {
@@ -5107,6 +5192,7 @@ export function openAiRealtimeProxy() {
             reasoning: { effort: 'minimal' },
             max_output_tokens: 100,
           }),
+          signal: AbortSignal.timeout(OPENAI_HUD_SUMMARY_TIMEOUT_MS),
         });
         const data = await response.json().catch(() => ({}));
         const summary = toFiveWordHudSummary(extractOpenAiResponseText(data));
@@ -5298,6 +5384,7 @@ export function openAiRealtimeProxy() {
             'OpenAI-Safety-Identifier': 'gev-local-dev',
           },
           body: JSON.stringify(sessionConfig),
+          signal: AbortSignal.timeout(OPENAI_REALTIME_TOKEN_TIMEOUT_MS),
         });
         const body = await response.text();
         res.statusCode = response.status;
@@ -5464,6 +5551,7 @@ export function googlePlacesContextProxy() {
               },
             },
           }),
+          signal: AbortSignal.timeout(GOOGLE_PLACES_TIMEOUT_MS),
         });
         const data = await response.json().catch(() => ({}));
         const seenPlaces = new Set();
@@ -5583,6 +5671,7 @@ export function googlePlacesContextProxy() {
             },
             maxResultCount: 5,
           }),
+          signal: AbortSignal.timeout(GOOGLE_PLACES_TIMEOUT_MS),
         });
         const data = await response.json().catch(() => ({}));
         const places = Array.isArray(data.places) ? data.places
@@ -6506,6 +6595,7 @@ function ingestAisStreamEnvelope(envelope) {
       type: vesselTypeFromAis(message, _aisStreamStatic.get(mmsi)),
       destination: stringValue(message.Destination),
       imo: stringValue(message.ImoNumber ?? message.IMO),
+      _updatedAt: Date.now(),
     };
     _aisStreamStatic.set(mmsi, staticData);
     mergeAisStaticIntoLiveVessel(mmsi, staticData);
@@ -6659,24 +6749,32 @@ function aisStreamRows(maxRows) {
 
 function pruneAisStreamCache() {
   const cutoff = Date.now() - AISSTREAM_STALE_MS;
+  const forget = (mmsi) => {
+    _aisStreamVessels.delete(mmsi);
+    _aisStreamTracks.delete(mmsi);
+    _aisStreamTrackPending.delete(mmsi);
+    _aisStreamStatic.delete(mmsi);
+  };
   for (const [mmsi, row] of _aisStreamVessels) {
-    if (row._updatedAt < cutoff) {
-      _aisStreamVessels.delete(mmsi);
-      _aisStreamTracks.delete(mmsi);
-      _aisStreamTrackPending.delete(mmsi);
-    }
+    if (row._updatedAt < cutoff) forget(mmsi);
   }
   // Pending single-fix entries for vessels never seen again must not leak
   const pendingCutoffSec = Math.floor(cutoff / 1000);
   for (const [mmsi, pending] of _aisStreamTrackPending) {
     if (pending.epochSec < pendingCutoffSec) _aisStreamTrackPending.delete(mmsi);
   }
+  // Static-only vessels never get a position row, so the vessel sweep above
+  // never reaches them. Without this pass the static map was the one companion
+  // map that grew without bound — one entry per distinct MMSI, forever.
+  for (const [mmsi, entry] of _aisStreamStatic) {
+    if (!_aisStreamVessels.has(mmsi) && !(entry._updatedAt >= cutoff)) {
+      _aisStreamStatic.delete(mmsi);
+    }
+  }
   if (_aisStreamVessels.size <= AISSTREAM_CACHE_MAX) return;
   const ordered = [..._aisStreamVessels.entries()].sort((a, b) => a[1]._updatedAt - b[1]._updatedAt);
   for (const [mmsi] of ordered.slice(0, _aisStreamVessels.size - AISSTREAM_CACHE_MAX)) {
-    _aisStreamVessels.delete(mmsi);
-    _aisStreamTracks.delete(mmsi);
-    _aisStreamTrackPending.delete(mmsi);
+    forget(mmsi);
   }
 }
 

@@ -1,4 +1,5 @@
 import * as Cesium from 'cesium';
+import { approxDistanceDegSq } from '../data/approxDistance.js';
 import { CITY_POIS, findPoiByName, flyToGlobeView, flyToLandmark, flyToPOI, flyToPresetLocation, GLOBE_VIEW, searchAndFlyTo } from '../locations.js';
 import {
   getContextStore,
@@ -2558,7 +2559,7 @@ function visibleEntityContexts(viewer, dataManager, { layerId = null, limit = 5,
     insertNearestRecord(nearbyRecords, {
       record,
       distanceScore: target
-        ? approximateCoordinateDistanceSq(targetLat, targetLon, record.latitude, record.longitude)
+        ? approxDistanceDegSq(targetLat, targetLon, record.latitude, record.longitude)
         : 0,
     }, VISIBLE_ENTITY_SHORTLIST);
   }
@@ -3134,12 +3135,6 @@ async function resolveWithin(promise, timeoutMs, fallback) {
   } finally {
     if (timeout) window.clearTimeout(timeout);
   }
-}
-
-function approximateCoordinateDistanceSq(latA, lonA, latB, lonB) {
-  const latDelta = latB - latA;
-  const lonDelta = (lonB - lonA) * Math.cos(Cesium.Math.toRadians((latA + latB) / 2));
-  return latDelta * latDelta + lonDelta * lonDelta;
 }
 
 function logSlowContext(startedAt, scope) {

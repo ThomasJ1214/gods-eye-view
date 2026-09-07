@@ -87,14 +87,34 @@ export function applyScope(records, scope, resolved) {
   return records;
 }
 
-/** Numeric summary for the narration layer. */
+/**
+ * Numeric summary for the narration layer.
+ *
+ * Swept in ONE pass rather than via `Math.min(...vals)`. An 'anywhere' scope
+ * over the live-AIS layer hands this every cached vessel (up to
+ * AISSTREAM_CACHE_MAX, 50 000) plus every other enabled layer's rows, which
+ * puts it within the same order of magnitude as the spread-argument limit —
+ * and that limit falls with call depth, so it is not a fixed number to sit
+ * just under. Exceeding it throws RangeError rather than returning a summary,
+ * the failure mode that silently dropped two of three FIRMS sources (#93).
+ * The sweep also drops the intermediate map/filter arrays.
+ */
 function summarize(items, sortField) {
   const summary = { count: items.length };
   if (sortField && items.length) {
-    const vals = items.map((r) => Number(r[sortField])).filter(Number.isFinite);
-    if (vals.length) {
-      summary[`${sortField}Min`] = Math.min(...vals);
-      summary[`${sortField}Max`] = Math.max(...vals);
+    let min = Infinity;
+    let max = -Infinity;
+    let seen = 0;
+    for (const record of items) {
+      const value = Number(record[sortField]);
+      if (!Number.isFinite(value)) continue;
+      seen += 1;
+      if (value < min) min = value;
+      if (value > max) max = value;
+    }
+    if (seen) {
+      summary[`${sortField}Min`] = min;
+      summary[`${sortField}Max`] = max;
     }
   }
   return summary;
