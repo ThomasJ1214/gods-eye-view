@@ -1,5 +1,5 @@
 import * as Cesium from 'cesium';
-import { approxDistanceKm } from './approxDistance.js';
+import { approxDistanceKm, normalizeLongitudeDeg, wrapLongitudeDeltaDeg } from './approxDistance.js';
 import { deriveFetchCenter, clampBoundsAroundCenter } from './trafficBounds.js';
 import { fetchFlowForBounds, getFlowSessionStats, resetFlowTileCache } from './flowTiles.js';
 import { matchFlowToRoads } from './flowMatch.js';
@@ -1063,9 +1063,13 @@ function getFetchCenter() {
  * @returns {{lat:number, lon:number}} Center point in degrees.
  */
 function getBoundsCenter(bounds) {
+  // Averaging west and east lands on the ANTIPODE when the rectangle crosses
+  // the antimeridian (179.9 and -179.9 average to 0, the Gulf of Guinea).
+  // Walk half the wrapped span east from `west` instead, then normalize.
+  const lonSpan = wrapLongitudeDeltaDeg(bounds.east - bounds.west);
   return {
     lat: (bounds.south + bounds.north) / 2,
-    lon: (bounds.west + bounds.east) / 2,
+    lon: normalizeLongitudeDeg(bounds.west + lonSpan / 2),
   };
 }
 
