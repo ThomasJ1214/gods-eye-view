@@ -183,6 +183,59 @@ if (verified.stdout?.trim()) info(`stdout: ${verified.stdout.trim()}`);
 if (verified.stderr?.trim()) info(`stderr: ${verified.stderr.trim()}`);
 if (verified.status !== 0 && REASONS[verified.status]) info(`meaning: ${REASONS[verified.status]}`);
 
+// ---- Step 5: why did the verifier's PowerShell fail? ----------------------
+// Step 4 failing with CouldNotAutoloadMatchingModule means Get-Acl's module
+// would not AUTO-load under the environment we handed PowerShell — even though
+// importing it by hand in a normal shell works. These probes separate the
+// candidate causes and test the candidate fix.
+console.log('\nStep 5 — isolate the PowerShell environment');
+
+const psEnv = { ...process.env, GEV_ACL_FILE: tmp, GEV_ACL_USER_SID: sid };
+info(`process.env.PSModulePath present: ${Object.prototype.hasOwnProperty.call(process.env, 'PSModulePath')}`);
+if (process.env.PSModulePath) {
+  info(`process.env.PSModulePath = ${process.env.PSModulePath}`);
+}
+info(`process.env.PSModuleAutoLoadingPreference = ${JSON.stringify(process.env.PSModuleAutoLoadingPreference)}`);
+
+const probe = (label, script, env = psEnv) => {
+  const r = spawnSync(expected.powershell, ['-NoProfile', '-NonInteractive', '-Command', script], {
+    env, encoding: 'utf8', windowsHide: true,
+  });
+  const out = (r.stdout || '').trim();
+  const err = (r.stderr || '').trim();
+  console.log(`\n  -- ${label}`);
+  info(`status=${r.status}`);
+  if (out) info(`stdout: ${out.split(/\r?\n/).slice(0, 6).join(' | ')}`);
+  if (err) info(`stderr: ${err.split(/\r?\n/).slice(0, 4).join(' | ')}`);
+  return r;
+};
+
+probe('engine + language mode (as spawned)',
+  "$PSVersionTable.PSVersion.ToString(); $ExecutionContext.SessionState.LanguageMode; $PSModuleAutoLoadingPreference");
+
+probe('PSModulePath as PowerShell sees it (as spawned)',
+  '$env:PSModulePath');
+
+const autoload = probe('Get-Acl via AUTO-load (what the app does today)',
+  "$ErrorActionPreference='Stop'; $null = Get-Acl -LiteralPath $env:GEV_ACL_FILE; 'AUTOLOAD-OK'");
+
+const explicit = probe('Get-Acl after an EXPLICIT Import-Module',
+  "$ErrorActionPreference='Stop'; Import-Module Microsoft.PowerShell.Security; $null = Get-Acl -LiteralPath $env:GEV_ACL_FILE; 'IMPORT-OK'");
+
+const dotnet = probe('CANDIDATE FIX: FileSecurity direct from .NET, no module',
+  "$ErrorActionPreference='Stop'; " +
+  "$acl = New-Object System.Security.AccessControl.FileSecurity($env:GEV_ACL_FILE, 'Access'); " +
+  "$r = @($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])); " +
+  "\"DOTNET-OK protected=$($acl.AreAccessRulesProtected) rules=$($r.Count)\"");
+
+console.log('\n  Step 5 summary:');
+const verdict = (label, r, token) => info(
+  `${label}: ${r.status === 0 && (r.stdout || '').includes(token) ? 'WORKS' : 'FAILS'}`,
+);
+verdict('auto-load (current app behaviour) ', autoload, 'AUTOLOAD-OK');
+verdict('explicit Import-Module          ', explicit, 'IMPORT-OK');
+verdict('direct .NET FileSecurity        ', dotnet, 'DOTNET-OK');
+
 console.log('\nActual DACL for reference:');
 const show = spawnSync(expected.icacls, [tmp], { encoding: 'utf8', windowsHide: true });
 console.log((show.stdout || '').trim());
