@@ -133,6 +133,18 @@ let _openskyCacheMeta = null;
 let _openskyCacheSourceEpochMs = null;
 /** TTL for the OpenSky response cache (ms). */
 const OPENSKY_CACHE_MS = 9000;
+/**
+ * Upstream deadlines for the OpenSky calls.
+ *
+ * Node's fetch has no overall response deadline — undici only gives up after
+ * ~300 s of header silence — and this handler has no in-flight coalescing (the
+ * GBFS / TomTom / terrain proxies do). A stalled upstream therefore held one
+ * request open while the client's 9 s poll opened another, and another, until
+ * dozens of sockets were parked on OpenSky. Every other upstream in this file
+ * carries an AbortSignal.timeout; these were the outliers.
+ */
+const OPENSKY_STATES_TIMEOUT_MS = 20_000;
+const OPENSKY_TOKEN_TIMEOUT_MS = 10_000;
 // --- OpenSky credit governor (field-test fix 2026-07-06) -------------------
 // The global /states/all this proxy fetches costs 4 CREDITS per call against
 // OpenSky's ~4000/day authenticated budget — a day with the app open burned
@@ -1380,6 +1392,16 @@ const OPENAI_REALTIME_REASONING_DEFAULT = 'low';
 const OPENAI_REALTIME_CONTEXT_TOKENS_DEFAULT = 3000;
 const OPENAI_REALTIME_CONTEXT_RETENTION_DEFAULT = 0.5;
 const OPENAI_HUD_SUMMARY_MODEL_DEFAULT = 'gpt-5-nano';
+/**
+ * Upstream deadlines for the key-brokering endpoints. Node's fetch has no
+ * overall response deadline of its own (undici gives up only after ~300 s of
+ * header silence), so without these a stalled provider parked a dev-server
+ * request — and the browser behind it — for minutes. Every other upstream in
+ * this file carries an AbortSignal.timeout; these were the outliers.
+ */
+const OPENAI_HUD_SUMMARY_TIMEOUT_MS = 30_000;
+const OPENAI_REALTIME_TOKEN_TIMEOUT_MS = 15_000;
+const GOOGLE_PLACES_TIMEOUT_MS = 15_000;
 const REALTIME_DEBUG_LOG_DIR = path.join(__dirname, '.gev-logs');
 const REALTIME_DEBUG_LOG_FILE = path.join(REALTIME_DEBUG_LOG_DIR, 'realtime-conversations.jsonl');
 const REALTIME_DEBUG_LOG_MAX_BYTES = 8 * 1024 * 1024;
@@ -1444,6 +1466,7 @@ async function getOpenSkyToken() {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`,
+          signal: AbortSignal.timeout(OPENSKY_TOKEN_TIMEOUT_MS),
         }
       );
 
@@ -3162,7 +3185,10 @@ function openSkyProxy() {
             }
           }
 
-          let upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers });
+          let upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', {
+            headers,
+            signal: AbortSignal.timeout(OPENSKY_STATES_TIMEOUT_MS),
+          });
           // Auto-mode fallback: if OAuth was rejected, retry with Basic credentials
           if (
             (upstream.status === 401 || upstream.status === 403) &&
@@ -3174,7 +3200,10 @@ function openSkyProxy() {
               Accept: 'application/json',
               Authorization: `Basic ${Buffer.from(`${basicUser}:${basicPass}`).toString('base64')}`,
             };
-            upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', { headers: retryHeaders });
+            upstream = await fetch('https://opensky-network.org/api/states/all?extended=1', {
+              headers: retryHeaders,
+              signal: AbortSignal.timeout(OPENSKY_STATES_TIMEOUT_MS),
+            });
             usedMode = 'basic';
             reason = 'oauth_rejected_fallback_basic';
           }
@@ -4868,6 +4897,8 @@ function adsbLolProxy() {
   let _cacheAt = 0;
   /** Response cache TTL (ms). */
   const CACHE_MS = 12000;
+  /** Upstream deadline — Node's fetch has none of its own. */
+  const ADSBLOL_MIL_TIMEOUT_MS = 15_000;
   return {
     name: 'adsblol-proxy',
     configureServer(server) {
@@ -4881,6 +4912,7 @@ function adsbLolProxy() {
           }
           const upstream = await fetch('https://api.adsb.lol/v2/mil', {
             headers: { 'User-Agent': 'gods-eye-view-adsblol-proxy/1.0' },
+            signal: AbortSignal.timeout(ADSBLOL_MIL_TIMEOUT_MS),
           });
           const body = await upstream.text();
           if (upstream.ok) {
@@ -5160,6 +5192,7 @@ export function openAiRealtimeProxy() {
             reasoning: { effort: 'minimal' },
             max_output_tokens: 100,
           }),
+          signal: AbortSignal.timeout(OPENAI_HUD_SUMMARY_TIMEOUT_MS),
         });
         const data = await response.json().catch(() => ({}));
         const summary = toFiveWordHudSummary(extractOpenAiResponseText(data));
@@ -5351,6 +5384,7 @@ export function openAiRealtimeProxy() {
             'OpenAI-Safety-Identifier': 'gev-local-dev',
           },
           body: JSON.stringify(sessionConfig),
+          signal: AbortSignal.timeout(OPENAI_REALTIME_TOKEN_TIMEOUT_MS),
         });
         const body = await response.text();
         res.statusCode = response.status;
@@ -5517,6 +5551,7 @@ export function googlePlacesContextProxy() {
               },
             },
           }),
+          signal: AbortSignal.timeout(GOOGLE_PLACES_TIMEOUT_MS),
         });
         const data = await response.json().catch(() => ({}));
         const seenPlaces = new Set();
@@ -5636,6 +5671,7 @@ export function googlePlacesContextProxy() {
             },
             maxResultCount: 5,
           }),
+          signal: AbortSignal.timeout(GOOGLE_PLACES_TIMEOUT_MS),
         });
         const data = await response.json().catch(() => ({}));
         const places = Array.isArray(data.places) ? data.places
