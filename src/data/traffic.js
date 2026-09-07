@@ -1,4 +1,5 @@
 import * as Cesium from 'cesium';
+import { approxDistanceKm } from './approxDistance.js';
 import { deriveFetchCenter, clampBoundsAroundCenter } from './trafficBounds.js';
 import { fetchFlowForBounds, getFlowSessionStats, resetFlowTileCache } from './flowTiles.js';
 import { matchFlowToRoads } from './flowMatch.js';
@@ -1080,10 +1081,7 @@ function getBoundsCenter(bounds) {
  * @returns {number} Distance in kilometres.
  */
 function distanceKm(a, b) {
-  const dLat = (a.lat - b.lat) * 111;
-  const avgLat = ((a.lat + b.lat) / 2) * (Math.PI / 180);
-  const dLon = (a.lon - b.lon) * 111 * Math.cos(avgLat);
-  return Math.sqrt((dLat * dLat) + (dLon * dLon));
+  return approxDistanceKm(a.lat, a.lon, b.lat, b.lon);
 }
 
 /**

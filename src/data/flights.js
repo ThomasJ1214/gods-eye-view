@@ -21,6 +21,9 @@
  */
 import * as Cesium from 'cesium';
 import { aircraftIncludedInNearby } from './aircraftNearbyPolicy.js';
+// Cheap equirectangular distance: accurate enough for the ~150 km proximity
+// gates below, runs once per contact per poll, and wraps the antimeridian.
+import { approxDistanceKm } from './approxDistance.js';
 import { registerPickOwner, unregisterPickOwner, isOwnedByOtherLayer, resolvePickId } from './pickRegistry.js';
 import {
   registerSpriteCollection,
@@ -628,19 +631,6 @@ const GROUND_FLOOR_WARM_MAX_ALT_M = 4500;
 const GROUND_FLOOR_CLAMP_RADIUS_KM = 150;
 /** @type {Map<string, number>} icao24 -> consecutive missed polls */
 let _missingPolls = new Map();
-
-/**
- * Cheap equirectangular distance (km) — plenty accurate for the ~150 km
- * ground-floor clamp gate; runs once per contact per poll, so no trig-heavy
- * haversine needed.
- * @param {number} lat1 @param {number} lon1 @param {number} lat2 @param {number} lon2
- * @returns {number} Approximate great-circle distance in km.
- */
-function _approxDistanceKm(lat1, lon1, lat2, lon2) {
-  const dLat = (lat2 - lat1) * 111.32;
-  const dLon = (lon2 - lon1) * 111.32 * Math.cos(((lat1 + lat2) / 2) * Math.PI / 180);
-  return Math.hypot(dLat, dLon);
-}
 
 /**
  * True when the aircraft's latest metadata reads "on or about the runway"
@@ -1940,7 +1930,7 @@ const FLOOR_EASE_EPSILON_M = 0.02;
  */
 function _heldDisplayFloorM(state, cell, nowMs) {
   if (state.heldTier && !(Number.isFinite(state.heldM) && state.heldCell
-    && _approxDistanceKm(cell.lat, cell.lon, state.heldCell.lat, state.heldCell.lon)
+    && approxDistanceKm(cell.lat, cell.lon, state.heldCell.lat, state.heldCell.lon)
       <= HELD_FLOOR_MAX_DRIFT_KM)) {
     // Out of range: the held value is no longer a measurement of anywhere this
     // contact has been. Drop it rather than stretch it.
@@ -2257,7 +2247,7 @@ function _collectDisplayCorridorCells(out, viewerLat, viewerLon) {
     // T7: a contact whose 3D model is the visual never reads a display floor.
     if (_modelOwnsVisual(icao24)) continue;
     if (!Number.isFinite(info.rawLat) || !Number.isFinite(info.rawLon)) continue;
-    if (_approxDistanceKm(viewerLat, viewerLon, info.rawLat, info.rawLon) > DISPLAY_CORRIDOR_RADIUS_KM) continue;
+    if (approxDistanceKm(viewerLat, viewerLon, info.rawLat, info.rawLon) > DISPLAY_CORRIDOR_RADIUS_KM) continue;
     const dr = _deadReckon(icao24, _scratchCorridorPos);
     if (!dr) continue;
     // Read the sibling scratches IMMEDIATELY, before any other _deadReckon call.
@@ -4262,7 +4252,7 @@ const flightsLayer = {
           // (the only ones whose exact height is visible; far contacts are
           // subpixel and always-on-top anyway).
           if (viewerLatDeg != null &&
-              _approxDistanceKm(viewerLatDeg, viewerLonDeg, lat, lon) <= GROUND_FLOOR_CLAMP_RADIUS_KM) {
+              approxDistanceKm(viewerLatDeg, viewerLonDeg, lat, lon) <= GROUND_FLOOR_CLAMP_RADIUS_KM) {
             floorWarmPoints.push({ lat, lon });
           }
           // Last synchronous resort for a BRAND-NEW grounded contact with NO
@@ -4332,7 +4322,7 @@ const flightsLayer = {
         if (!onGround && renderAltitudeM < GROUND_FLOOR_WARM_MAX_ALT_M &&
             (icao24 === _trackedIcao ||
               (viewerLatDeg != null &&
-                _approxDistanceKm(viewerLatDeg, viewerLonDeg, lat, lon) <= GROUND_FLOOR_CLAMP_RADIUS_KM))) {
+                approxDistanceKm(viewerLatDeg, viewerLonDeg, lat, lon) <= GROUND_FLOOR_CLAMP_RADIUS_KM))) {
           renderAltitudeM = floorAltitudeM(renderAltitudeM, cachedGroundFloor(lat, lon));
           floorWarmPoints.push({ lat, lon });
         }

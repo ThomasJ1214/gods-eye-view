@@ -1400,7 +1400,13 @@ let _aisNeedsRearm = false;
 let _aisWebSocketImpl;
 /** @type {Map<string,object>} */
 const _aisStreamVessels = new Map();
-/** @type {Map<string,object>} */
+/**
+ * mmsi -> last-seen ShipStaticData (name/type/destination/IMO), merged into
+ * position reports that omit it. Pruned alongside _aisStreamVessels: a vessel
+ * that only ever sent static data has no position row to age out, so it needs
+ * its own timestamp to be evictable at all.
+ * @type {Map<string,{name?:string,type?:string,destination?:string,imo?:string,_updatedAt:number}>}
+ */
 const _aisStreamStatic = new Map();
 /** @type {Map<string,{lats:Float32Array,lons:Float32Array,times:Uint32Array,head:number,len:number}>} mmsi -> track ring buffer */
 const _aisStreamTracks = new Map();
@@ -2390,26 +2396,73 @@ function terrainHeightsProxy() {
 function adsbdbProxy() {
   const TTL_MS = 24 * 3600_000;
   const CACHE_PATH = path.join(process.cwd(), '.gev-cache', 'adsbdb.json');
-  let cache = { routes: {}, aircraft: {} };
+  /**
+   * Per-kind entry cap. Every other cache in this file is bounded
+   * (ADSBLOL_POINT_CACHE_MAX, OVERPASS_CACHE_MAX_ENTRIES, TRACK_CACHE_MAX);
+   * this one was not, so a long-lived dev server accumulated an entry for
+   * every callsign and hex address it ever saw — in memory AND in the JSON it
+   * rewrites to disk every 15 s. Maps replace the former plain objects so
+   * insertion order gives a cheap oldest-first eviction.
+   */
+  const CACHE_MAX_ENTRIES = 4000;
+  /** @type {{routes: Map<string, object>, aircraft: Map<string, object>}} */
+  const cache = { routes: new Map(), aircraft: new Map() };
   let dirty = false;
-  let loaded = false;
+  /** @type {Promise<void>|null} The single in-flight (or settled) disk load. */
+  let loadPromise = null;
   const inflight = new Map();
 
-  async function loadOnce() {
-    if (loaded) return;
-    loaded = true;
-    try {
-      const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
-      cache = { routes: parsed.routes ?? {}, aircraft: parsed.aircraft ?? {} };
-    } catch { /* first run */ }
-    setInterval(async () => {
-      if (!dirty) return;
-      dirty = false;
+  /** Store an entry, evicting the oldest once the kind is at capacity. */
+  function remember(store, key, entry) {
+    store.delete(key); // re-insert so a refreshed key becomes the newest
+    store.set(key, entry);
+    while (store.size > CACHE_MAX_ENTRIES) {
+      const oldest = store.keys().next().value;
+      if (oldest === undefined) break;
+      store.delete(oldest);
+    }
+  }
+
+  /** Seed a Map from the persisted object, newest-last and capped. */
+  function hydrate(store, persisted) {
+    if (!persisted || typeof persisted !== 'object') return;
+    const entries = Object.entries(persisted)
+      .filter(([, entry]) => entry && Number.isFinite(entry.at))
+      .sort((a, b) => a[1].at - b[1].at) // oldest first, so the cap keeps the newest
+      .slice(-CACHE_MAX_ENTRIES);
+    for (const [key, entry] of entries) if (!store.has(key)) store.set(key, entry);
+  }
+
+  /**
+   * Read the disk cache exactly once, and make every caller await the SAME
+   * promise. The previous `loaded` boolean was set before the await, so a
+   * second concurrent request saw "loaded", raced ahead, and cached its
+   * lookup into a `cache` object that the still-pending read then REPLACED
+   * wholesale — losing that result and writing the disk snapshot back over it.
+   * Mutating shared Maps instead of reassigning removes the seam entirely.
+   */
+  function loadOnce() {
+    if (loadPromise) return loadPromise;
+    loadPromise = (async () => {
       try {
-        await fsp.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-        await fsp.writeFile(CACHE_PATH, JSON.stringify(cache), 'utf8');
-      } catch { dirty = true; } // retry next tick
-    }, 15_000).unref?.();
+        const parsed = JSON.parse(await fsp.readFile(CACHE_PATH, 'utf8'));
+        hydrate(cache.routes, parsed.routes);
+        hydrate(cache.aircraft, parsed.aircraft);
+      } catch { /* first run */ }
+      setInterval(async () => {
+        if (!dirty) return;
+        dirty = false;
+        try {
+          await fsp.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+          const snapshot = {
+            routes: Object.fromEntries(cache.routes),
+            aircraft: Object.fromEntries(cache.aircraft),
+          };
+          await fsp.writeFile(CACHE_PATH, JSON.stringify(snapshot), 'utf8');
+        } catch { dirty = true; } // retry next tick
+      }, 15_000).unref?.();
+    })();
+    return loadPromise;
   }
 
   const fresh = (e) => e && Date.now() - e.at < TTL_MS;
@@ -2438,7 +2491,7 @@ function adsbdbProxy() {
 
   function lookup(kind, key) {
     const store = kind === 'route' ? cache.routes : cache.aircraft;
-    if (fresh(store[key])) return Promise.resolve(store[key].data);
+    if (fresh(store.get(key))) return Promise.resolve(store.get(key).data);
     const ik = `${kind}:${key}`;
     if (!inflight.has(ik)) {
       inflight.set(ik, (async () => {
@@ -2449,18 +2502,18 @@ function adsbdbProxy() {
           const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
           if (res.ok) {
             const data = kind === 'route' ? parseRoute(await res.json()) : parseAircraft(await res.json());
-            store[key] = { at: Date.now(), data }; // data may be null — negative cache
+            remember(store, key, { at: Date.now(), data }); // data may be null — negative cache
             dirty = true;
             return data;
           }
           if (res.status === 404) {
-            store[key] = { at: Date.now(), data: null }; // known-missing — cache the miss
+            remember(store, key, { at: Date.now(), data: null }); // known-missing — cache the miss
             dirty = true;
           }
           // other statuses: leave uncached so we retry later
-          return fresh(store[key]) ? store[key].data : null;
+          return fresh(store.get(key)) ? store.get(key).data : null;
         } catch {
-          return fresh(store[key]) ? store[key].data : null; // network error → stale if any
+          return fresh(store.get(key)) ? store.get(key).data : null; // network error → stale if any
         } finally {
           inflight.delete(ik);
         }
@@ -6506,6 +6559,7 @@ function ingestAisStreamEnvelope(envelope) {
       type: vesselTypeFromAis(message, _aisStreamStatic.get(mmsi)),
       destination: stringValue(message.Destination),
       imo: stringValue(message.ImoNumber ?? message.IMO),
+      _updatedAt: Date.now(),
     };
     _aisStreamStatic.set(mmsi, staticData);
     mergeAisStaticIntoLiveVessel(mmsi, staticData);
@@ -6659,24 +6713,32 @@ function aisStreamRows(maxRows) {
 
 function pruneAisStreamCache() {
   const cutoff = Date.now() - AISSTREAM_STALE_MS;
+  const forget = (mmsi) => {
+    _aisStreamVessels.delete(mmsi);
+    _aisStreamTracks.delete(mmsi);
+    _aisStreamTrackPending.delete(mmsi);
+    _aisStreamStatic.delete(mmsi);
+  };
   for (const [mmsi, row] of _aisStreamVessels) {
-    if (row._updatedAt < cutoff) {
-      _aisStreamVessels.delete(mmsi);
-      _aisStreamTracks.delete(mmsi);
-      _aisStreamTrackPending.delete(mmsi);
-    }
+    if (row._updatedAt < cutoff) forget(mmsi);
   }
   // Pending single-fix entries for vessels never seen again must not leak
   const pendingCutoffSec = Math.floor(cutoff / 1000);
   for (const [mmsi, pending] of _aisStreamTrackPending) {
     if (pending.epochSec < pendingCutoffSec) _aisStreamTrackPending.delete(mmsi);
   }
+  // Static-only vessels never get a position row, so the vessel sweep above
+  // never reaches them. Without this pass the static map was the one companion
+  // map that grew without bound — one entry per distinct MMSI, forever.
+  for (const [mmsi, entry] of _aisStreamStatic) {
+    if (!_aisStreamVessels.has(mmsi) && !(entry._updatedAt >= cutoff)) {
+      _aisStreamStatic.delete(mmsi);
+    }
+  }
   if (_aisStreamVessels.size <= AISSTREAM_CACHE_MAX) return;
   const ordered = [..._aisStreamVessels.entries()].sort((a, b) => a[1]._updatedAt - b[1]._updatedAt);
   for (const [mmsi] of ordered.slice(0, _aisStreamVessels.size - AISSTREAM_CACHE_MAX)) {
-    _aisStreamVessels.delete(mmsi);
-    _aisStreamTracks.delete(mmsi);
-    _aisStreamTrackPending.delete(mmsi);
+    forget(mmsi);
   }
 }
 
