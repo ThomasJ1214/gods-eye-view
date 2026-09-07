@@ -272,3 +272,58 @@ test('Windows production hardener applies its exact DACL with native tools', {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('Windows ACL verification does not depend on a PowerShell module', () => {
+  // Regression: the verifier used Get-Acl, which lives in
+  // Microsoft.PowerShell.Security. The app spawns Windows PowerShell 5.1 while
+  // inheriting the caller's environment, so on a machine with PowerShell 7
+  // installed 5.1 resolved PS7's copy of that module off PS7's PSModulePath and
+  // failed loading its type data ("The member AuditToString is already
+  // present"), surfacing as CouldNotAutoloadMatchingModule. The DACL had been
+  // applied correctly; only the read-back could not run, and the key was
+  // discarded anyway. Constructing FileSecurity from .NET needs no module.
+  let verifyScript = null;
+  const result = hardenCredentialFile('C:\\GEV\\.env.tmp', {
+    platform: 'win32',
+    environment: { SYSTEMROOT: WINDOWS_ROOT },
+    fileSystem: windowsFileSystem(),
+    spawn(command, args) {
+      if (command.endsWith('\\whoami.exe')) {
+        return { status: 0, signal: null, stdout: `"WORKSTATION\\alice","${USER_SID}"\r\n` };
+      }
+      if (command.endsWith('\\powershell.exe')) verifyScript = args.at(-1);
+      return { status: 0, signal: null };
+    },
+  });
+
+  assert.equal(result, true);
+  assert.ok(verifyScript, 'the verifier should have been invoked');
+  assert.doesNotMatch(verifyScript, /Get-Acl/, 'must not reach for the Security module');
+  assert.doesNotMatch(verifyScript, /Import-Module/, 'must not import a module either');
+  assert.match(verifyScript, /New-Object System\.Security\.AccessControl\.FileSecurity/);
+  // The DACL section is the one being verified, and the path still comes from
+  // the environment rather than being interpolated into the script text.
+  assert.match(verifyScript, /\$env:GEV_ACL_FILE/);
+  assert.match(verifyScript, /'Access'/);
+});
+
+test('Windows hardening still fails closed when the verifier itself errors', () => {
+  // The point of the change is to stop a WORKING ACL being thrown away because
+  // the read-back could not run — not to stop checking. A verifier that runs
+  // and reports a mismatch must still refuse.
+  for (const verifierStatus of [1, 2, 5, 7]) {
+    const result = hardenCredentialFile('C:\\GEV\\.env.tmp', {
+      platform: 'win32',
+      environment: { SYSTEMROOT: WINDOWS_ROOT },
+      fileSystem: windowsFileSystem(),
+      spawn(command) {
+        if (command.endsWith('\\whoami.exe')) {
+          return { status: 0, signal: null, stdout: `"WORKSTATION\\alice","${USER_SID}"\r\n` };
+        }
+        if (command.endsWith('\\powershell.exe')) return { status: verifierStatus, signal: null };
+        return { status: 0, signal: null };
+      },
+    });
+    assert.equal(result, false, `verifier exit ${verifierStatus} must refuse`);
+  }
+});

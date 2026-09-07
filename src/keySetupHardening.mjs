@@ -6,10 +6,33 @@ import {
   parseWindowsUserSid,
 } from './keySetupCore.mjs';
 
-/** PowerShell verification for the exact owner-only Windows credential DACL. */
+/**
+ * PowerShell verification for the exact owner-only Windows credential DACL.
+ *
+ * The ACL is read by CONSTRUCTING a FileSecurity directly, not via `Get-Acl`.
+ * `Get-Acl` lives in the Microsoft.PowerShell.Security module, and this app
+ * spawns Windows PowerShell 5.1 while inheriting the caller's environment. On
+ * a machine with PowerShell 7 installed — a very ordinary setup — that
+ * environment carries PS7's PSModulePath, so 5.1 resolves PS7's copy of the
+ * module first and dies loading its type data against 5.1's own:
+ *
+ *   Import-Module : The following error occurred while loading the extended
+ *   type data file: Error in TypeData "System.Security.AccessControl
+ *   .ObjectSecurity": The member AuditToString is already present.
+ *
+ * which surfaces to autoload as CouldNotAutoloadMatchingModule. The DACL had
+ * been applied CORRECTLY at that point — icacls reported the three expected
+ * FullControl principals with inheritance off — but the verifier could not run,
+ * so hardening failed closed and the key was discarded. Failing closed is right;
+ * treating "I could not run my verifier" as "the ACL is wrong" is not.
+ *
+ * FileSecurity is plain .NET Framework, always present wherever 5.1 runs, and
+ * needs no module. Every check below operates on the same ObjectSecurity-derived
+ * object `Get-Acl` returned, so the verification is unchanged in strength.
+ */
 const WINDOWS_ACL_VERIFY_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
-  '$acl = Get-Acl -LiteralPath $env:GEV_ACL_FILE',
+  "$acl = New-Object System.Security.AccessControl.FileSecurity($env:GEV_ACL_FILE, 'Access')",
   'if (-not $acl.AreAccessRulesProtected) { exit 2 }',
   "$allowed = @($env:GEV_ACL_USER_SID, 'S-1-5-18', 'S-1-5-32-544')",
   '$seen = @{}',
